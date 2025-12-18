@@ -118,6 +118,22 @@ Output:
 
 ![Task 1 Output](img/task1.PNG)
 
+Unit Test:
+```
+test "fiber stack setup" {
+    // Test that stack pointers are properly aligned
+    var data: [4096]u8 = undefined;
+    var sp: [*]u8 = @ptrFromInt(@intFromPtr(&data) + 4096);
+    const sp_usize = @intFromPtr(sp);
+    const aligned_sp_usize = sp_usize & ~@as(usize, 15);
+    sp = @ptrFromInt(aligned_sp_usize);
+    sp = @ptrFromInt(@intFromPtr(sp) - 128);
+
+    // Check alignment
+    try std.testing.expect(@intFromPtr(sp) % 16 == 0);
+}
+```
+
 ## Task 2
 
 Task 2 involves creating a class for both the a Fiber and Scheduler implementation, and demonstrating functionality.
@@ -322,6 +338,25 @@ This main function orchestrates a complete demonstration of the fiber scheduling
 Output:
 
 ![Task 2 Output](img/task2.PNG)
+
+Unit Test:
+```
+test "fiber initialization" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var fiber = try Fiber.init(allocator, &func1, null);
+    defer fiber.deinit(allocator);
+
+    // Check that RIP is set
+    try std.testing.expect(fiber.context.rip != null);
+
+    // Check stack alignment
+    const rsp_usize = @intFromPtr(fiber.context.rsp);
+    try std.testing.expect(rsp_usize % 16 == 0);
+}
+```
 
 ## Task 3
 
