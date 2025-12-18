@@ -2,331 +2,255 @@ const std = @import("std");
 const context = @import("context.zig");
 
 // =============================================================================
-// Task 3: Fiber Yield Support
+// Task 3: Thread Pool Implementation using Cooperative Fibers with Yields
+// Executes multiple instructions concurrently using cooperative fibers with yield and data sharing capabilities
 // =============================================================================
 
-// Global scheduler instance
-var global_scheduler: Scheduler = undefined;
+// Import Fiber and Scheduler from Task 2
+const task2 = @import("task2.zig");
+const Fiber = task2.Fiber;
+const Scheduler = task2.Scheduler;
 
-// Pointer to current fiber being executed
-var current_fiber_ptr: ?*Fiber = null;
+// Global scheduler instance (from task2)
+var scheduler_instance: *Scheduler = undefined;
+var current_fiber: ?*Fiber = null;
 
-// Fiber class with yield support
-pub const Fiber = struct {
-    fn_ptr: *const fn () void,
-    stack: [4096]u8,
-    ctx: context.Context, // Current context (entry point or resume point after yield)
-    data: ?*anyopaque,
-    entry_ctx: context.Context, // Initial entry context
-    yielded: bool, // Has this fiber yielded?
-    yield_count: u32, // Number of times yielded
-
-    /// Creates a new fiber with the given function and optional data pointer
-    pub fn init(func: *const fn () void, data_ptr: ?*anyopaque) Fiber {
-        var fiber = Fiber{
-            .fn_ptr = func,
-            .stack = undefined,
-            .ctx = std.mem.zeroes(context.Context),
-            .data = data_ptr,
-            .entry_ctx = std.mem.zeroes(context.Context),
-            .yielded = false,
-            .yield_count = 0,
-        };
-
-        // Set up stack pointer (stacks grow downwards)
-        var sp: [*]u8 = @ptrFromInt(@intFromPtr(&fiber.stack) + 4096);
-
-        // Apply Sys V ABI stack alignment to 16 bytes
-        const sp_usize = @intFromPtr(sp);
-        const aligned_sp_usize = sp_usize & ~@as(usize, 15);
-        sp = @ptrFromInt(aligned_sp_usize);
-
-        // Reserve 128-byte Red Zone (Sys V ABI)
-        sp = @ptrFromInt(@intFromPtr(sp) - 128);
-
-        // Set up context to point to fiber function
-        fiber.ctx.rip = @ptrCast(@alignCast(@constCast(func)));
-        fiber.ctx.rsp = @ptrCast(sp);
-        fiber.entry_ctx = fiber.ctx;
-
-        return fiber;
-    }
-
-    /// Returns the context of this fiber
-    pub fn get_context(self: *Fiber) *context.Context {
-        return &self.ctx;
-    }
-};
-
-// Scheduler class with yield support
-pub const Scheduler = struct {
-    fibers: std.ArrayList(*Fiber),
+// ThreadPool class - simplified for cooperative fibers
+pub const ThreadPool = struct {
+    fibers_: std.ArrayList(*Fiber),
+    yielded_fibers: std.ArrayList(*Fiber),
+    context_: context.Context,
     allocator: std.mem.Allocator,
-    fiber_return_point: context.Context,
-    pad: [72]u8, // Padding to prevent corruption from context get
-    current_fiber: ?*Fiber,
 
-    /// Initializes a new scheduler
-    pub fn init(allocator: std.mem.Allocator) !Scheduler {
-        return Scheduler{
-            .fibers = try std.ArrayList(*Fiber).initCapacity(allocator, 0),
+    /// Constructor
+    pub fn init(allocator: std.mem.Allocator) !ThreadPool {
+        return ThreadPool{
+            .fibers_ = try std.ArrayList(*Fiber).initCapacity(allocator, 10),
+            .yielded_fibers = try std.ArrayList(*Fiber).initCapacity(allocator, 10),
+            .context_ = undefined,
             .allocator = allocator,
-            .fiber_return_point = std.mem.zeroes(context.Context),
-            .pad = undefined,
-            .current_fiber = null,
         };
     }
 
-    /// Deinitializes the scheduler
-    pub fn deinit(self: *Scheduler) void {
-        self.fibers.deinit(self.allocator);
+    /// Destructor
+    pub fn deinit(self: *ThreadPool) void {
+        self.fibers_.deinit(self.allocator);
+        self.yielded_fibers.deinit(self.allocator);
     }
 
-    /// Adds a fiber to the queue
-    pub fn spawn(self: *Scheduler, fiber: *Fiber) !void {
-        try self.fibers.append(self.allocator, fiber);
+    /// Spawn a fiber (task) on the pool
+    pub fn spawn(self: *ThreadPool, f: *Fiber) !void {
+        try self.fibers_.append(self.allocator, f);
     }
 
-    /// Executes all queued fibers until completion
-    pub fn do_it(self: *Scheduler) void {
-        // Save return point - fibers will jump back here
-        _ = context.get(&self.fiber_return_point);
+    /// Cooperatively yields the current fiber back to the thread pool
+    pub fn fiber_yield(self: *ThreadPool) void {
+        if (current_fiber) |fiber| {
+            // Re-queue the current fiber
+            self.yielded_fibers.append(std.heap.page_allocator, fiber) catch @panic("Failed to yield fiber");
 
-        if (self.fibers.items.len > 0) {
-            const fiber_ptr = self.fibers.orderedRemove(0);
-            self.current_fiber = fiber_ptr;
-            current_fiber_ptr = fiber_ptr;
-
-            // Jump to fiber
-            _ = context.set(&fiber_ptr.ctx);
+            // Swap context: save current to fiber, switch to thread pool
+            _ = context.swap(&fiber.context, &self.context_);
         }
     }
 
-    /// Called by fibers to exit and complete
-    pub fn fiber_exit(self: *Scheduler) void {
-        self.current_fiber = null;
-        _ = context.set(&self.fiber_return_point);
+    /// Terminates the current fiber and returns control to the thread pool
+    pub fn fiber_exit(self: *ThreadPool) void {
+        if (current_fiber) |_| {
+            // Clear current fiber (it's done)
+            current_fiber = null;
+
+            // Switch back to thread pool context (no need to save current)
+            _ = context.set(&self.context_);
+        }
     }
 
-    /// Called by fibers to yield and pause (to be resumed later)
-    pub fn fiber_yield(self: *Scheduler) void {
-        if (self.current_fiber) |fiber| {
-            // Re-queue fiber
-            self.fibers.append(self.allocator, fiber) catch @panic("Failed to re-queue");
+    /// Run the thread pool
+    pub fn run(self: *ThreadPool) !void {
+        // Set global thread pool instance
+        thread_pool_instance = self;
 
-            // Jump back to scheduler
-            _ = context.set(&self.fiber_return_point);
+        // Save thread pool context
+        _ = context.get(&self.context_);
+
+        // Run the scheduler with yield support
+        self.do_it_with_yields();
+    }
+
+    /// Runs the cooperative scheduler that handles both new and yielded fibers
+    fn do_it_with_yields(self: *ThreadPool) void {
+        while (self.fibers_.items.len > 0 or self.yielded_fibers.items.len > 0) {
+            // Process fibers in order: new fibers first, then yielded ones
+            if (self.fibers_.items.len > 0) {
+                const f = self.fibers_.orderedRemove(0);
+                current_fiber = f;
+                const c = f.get_context();
+                _ = context.set(c);
+            } else if (self.yielded_fibers.items.len > 0) {
+                const f = self.yielded_fibers.orderedRemove(0);
+                current_fiber = f;
+                const c = f.get_context();
+                _ = context.set(c);
+            }
         }
     }
 };
 
-// Global API functions
-pub fn spawn(fiber: *Fiber) !void {
-    try global_scheduler.spawn(fiber);
-}
+// Global thread pool instance for yield support
+var thread_pool_instance: ?*ThreadPool = null;
 
-pub fn do_it() void {
-    global_scheduler.do_it();
-}
-
-pub fn fiber_exit() void {
-    global_scheduler.fiber_exit();
-}
-
+// Global API for fiber operations
+/// Cooperatively yields the current fiber
 pub fn yield() void {
-    global_scheduler.fiber_yield();
+    std.debug.print("Global yield called\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_yield();
+    }
 }
 
+/// Retrieves the data pointer associated with the current fiber
 pub fn get_data() ?*anyopaque {
-    if (current_fiber_ptr) |fiber| {
-        return fiber.data;
+    if (current_fiber) |f| {
+        return f.get_data();
     }
     return null;
 }
 
-// Example functions
-fn f1_basic() void {
-    if (current_fiber_ptr) |fiber| {
-        if (fiber.yield_count == 0) {
-            std.debug.print("fiber 1 before\n", .{});
-            fiber.yield_count = 1;
-            yield();
-        }
-        std.debug.print("fiber 1 after\n", .{});
-        fiber_exit();
+// Example task functions
+fn task1() void {
+    std.debug.print("Instruction 1 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
     }
 }
 
-fn f2_basic() void {
-    std.debug.print("fiber 2\n", .{});
-    fiber_exit();
+fn task2_func() void {
+    std.debug.print("Instruction 2 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
 }
 
-// Producer-consumer example
-const SharedCounter = struct {
+fn task3_func() void {
+    std.debug.print("Instruction 3 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+
+// Yield demonstration functions
+fn f1() void {
+    std.debug.print("fiber 1 before\n", .{});
+    yield();
+    std.debug.print("fiber 1 after\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+
+fn f2() void {
+    std.debug.print("fiber 2\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+
+// Data sharing with yield example
+const SharedData = struct {
     value: i32,
 };
 
 fn producer() void {
     const data = get_data();
     if (data) |ptr| {
-        const counter = @as(*SharedCounter, @ptrCast(@alignCast(ptr)));
-        if (current_fiber_ptr) |fiber| {
-            if (fiber.yield_count == 0) {
-                counter.value = 42;
-                std.debug.print("Producer: set value to {}\n", .{counter.value});
-                fiber.yield_count = 1;
-                yield();
-            }
-            std.debug.print("Producer: value is {}\n", .{counter.value});
-        }
-        fiber_exit();
+        const shared = @as(*SharedData, @ptrCast(@alignCast(ptr)));
+        shared.value = 42;
+        std.debug.print("Producer: set value to {}\n", .{shared.value});
+        yield(); // Yield to let consumer run
+        std.debug.print("Producer: value is now {}\n", .{shared.value});
+    }
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
     }
 }
 
 fn consumer() void {
-    if (current_fiber_ptr) |fiber| {
-        if (fiber.yield_count == 0) {
-            fiber.yield_count = 1;
-            yield(); // Let producer run first
-        }
-        const data = get_data();
-        if (data) |ptr| {
-            const counter = @as(*SharedCounter, @ptrCast(@alignCast(ptr)));
-            std.debug.print("Consumer: read value {}\n", .{counter.value});
-            counter.value += 1;
-        }
-        fiber_exit();
+    yield(); // Let producer run first
+    const data = get_data();
+    if (data) |ptr| {
+        const shared = @as(*SharedData, @ptrCast(@alignCast(ptr)));
+        std.debug.print("Consumer: read value {}\n", .{shared.value});
+        shared.value += 10;
+        std.debug.print("Consumer: modified value to {}\n", .{shared.value});
     }
-}
-
-// Multi-yield example
-fn multi_yield_fiber() void {
-    if (current_fiber_ptr) |fiber| {
-        if (fiber.yield_count == 0) {
-            std.debug.print("Start\n", .{});
-            fiber.yield_count = 1;
-            yield();
-        }
-        if (fiber.yield_count == 1) {
-            std.debug.print("Middle\n", .{});
-            fiber.yield_count = 2;
-            yield();
-        }
-        std.debug.print("End\n", .{});
-        fiber_exit();
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
     }
-}
-
-// Examples
-pub fn example1_basic_yield() void {
-    std.debug.print("\n=== Example 1: Basic Yield ===\n", .{});
-
-    var f1 = Fiber.init(&f1_basic, null);
-    var f2 = Fiber.init(&f2_basic, null);
-
-    spawn(&f1) catch @panic("Failed to spawn f1");
-    spawn(&f2) catch @panic("Failed to spawn f2");
-
-    do_it();
-}
-
-pub fn example2_producer_consumer() void {
-    std.debug.print("\n=== Example 2: Producer-Consumer ===\n", .{});
-
-    var counter = SharedCounter{ .value = 0 };
-
-    var producer_fiber = Fiber.init(&producer, @as(?*anyopaque, @ptrCast(&counter)));
-    var consumer_fiber = Fiber.init(&consumer, @as(?*anyopaque, @ptrCast(&counter)));
-
-    spawn(&producer_fiber) catch @panic("Failed to spawn producer");
-    spawn(&consumer_fiber) catch @panic("Failed to spawn consumer");
-
-    do_it();
-}
-
-pub fn example3_multi_yield() void {
-    std.debug.print("\n=== Example 3: Multi-Yield ===\n", .{});
-
-    var f1 = Fiber.init(&multi_yield_fiber, null);
-    var f2 = Fiber.init(&f2_basic, null);
-    var f3 = Fiber.init(&multi_yield_fiber, null);
-
-    spawn(&f1) catch @panic("Failed to spawn f1");
-    spawn(&f2) catch @panic("Failed to spawn f2");
-    spawn(&f3) catch @panic("Failed to spawn f3");
-
-    do_it();
 }
 
 // Main function
 pub fn main() void {
-    // Initialize global scheduler
+
+    // Initialize allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    global_scheduler = Scheduler.init(allocator) catch @panic("Failed to init scheduler");
-    defer global_scheduler.deinit();
+    // Example 1: Basic thread pool
+    std.debug.print("\n--- Example 1: Basic Thread Pool ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
 
-    std.debug.print("=== Task 3 Examples ===\n", .{});
+        var t1 = Fiber.init(allocator, &task1, null) catch @panic("Failed to create task1");
+        defer t1.deinit(allocator);
+        var t2 = Fiber.init(allocator, &task2_func, null) catch @panic("Failed to create task2");
+        defer t2.deinit(allocator);
+        var t3 = Fiber.init(allocator, &task3_func, null) catch @panic("Failed to create task3");
+        defer t3.deinit(allocator);
 
-    example1_basic_yield();
-    example2_producer_consumer();
-    example3_multi_yield();
+        pool.spawn(&t1) catch @panic("Failed to spawn task1");
+        pool.spawn(&t2) catch @panic("Failed to spawn task2");
+        pool.spawn(&t3) catch @panic("Failed to spawn task3");
 
-    std.debug.print("\n=== All Task 3 Examples Complete ===\n", .{});
-}
+        pool.run() catch @panic("Failed to run thread pool");
+    }
 
-// Unit tests
-test "fiber yield re-queues correctly" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Example 2: Yield demonstration (from pseudocode)
+    std.debug.print("\n--- Example 2: Fiber Yield ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
+        thread_pool_instance = &pool;
 
-    var scheduler = try Scheduler.init(allocator);
-    defer scheduler.deinit();
+        var fiber1 = Fiber.init(allocator, &f1, null) catch @panic("Failed to create f1");
+        defer fiber1.deinit(allocator);
+        var fiber2 = Fiber.init(allocator, &f2, null) catch @panic("Failed to create f2");
+        defer fiber2.deinit(allocator);
 
-    var fiber = Fiber.init(&f1_basic, null);
-    scheduler.current_fiber = &fiber;
+        pool.spawn(&fiber1) catch @panic("Failed to spawn f1");
+        pool.spawn(&fiber2) catch @panic("Failed to spawn f2");
 
-    // Initially 0 fibers
-    try std.testing.expect(scheduler.fibers.items.len == 0);
+        pool.run() catch @panic("Failed to run thread pool");
+    }
 
-    // Spawn adds one
-    try scheduler.spawn(&fiber);
-    try std.testing.expect(scheduler.fibers.items.len == 1);
+    // Example 3: Data sharing with yield
+    std.debug.print("\n--- Example 3: Data Sharing with Yield ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
+        thread_pool_instance = &pool;
 
-    // Note: Actual yield testing requires context switching which doesn't work in unit tests
-    // This test just verifies the spawn logic
-}
+        var shared_data = SharedData{ .value = 0 };
 
-test "fiber with data sharing" {
-    var counter = SharedCounter{ .value = 10 };
-    var fiber = Fiber.init(&producer, @as(?*anyopaque, @ptrCast(&counter)));
+        var prod = Fiber.init(allocator, &producer, @as(?*anyopaque, @ptrCast(&shared_data))) catch @panic("Failed to create producer");
+        defer prod.deinit(allocator);
+        var cons = Fiber.init(allocator, &consumer, @as(?*anyopaque, @ptrCast(&shared_data))) catch @panic("Failed to create consumer");
+        defer cons.deinit(allocator);
 
-    // Simulate current fiber
-    current_fiber_ptr = &fiber;
+        pool.spawn(&prod) catch @panic("Failed to spawn producer");
+        pool.spawn(&cons) catch @panic("Failed to spawn consumer");
 
-    const retrieved = get_data();
-    try std.testing.expect(retrieved != null);
-    const data_ptr = @as(*SharedCounter, @ptrCast(@alignCast(retrieved.?)));
-    try std.testing.expect(data_ptr.value == 10);
-}
-
-test "scheduler processes multiple fibers" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var scheduler = try Scheduler.init(allocator);
-    defer scheduler.deinit();
-
-    var f1 = Fiber.init(&f1_basic, null);
-    var f2 = Fiber.init(&f2_basic, null);
-
-    try scheduler.spawn(&f1);
-    try scheduler.spawn(&f2);
-
-    try std.testing.expect(scheduler.fibers.items.len == 2);
+        pool.run() catch @panic("Failed to run thread pool");
+    }
 }

@@ -90,6 +90,7 @@ pub fn build(b: *std.Build) void {
     // Including C files
     exe.addIncludePath(b.path("clib"));
     exe.addObjectFile(b.path("clib/context_win.obj"));
+    exe.linkLibC();
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -113,6 +114,7 @@ pub fn build(b: *std.Build) void {
     // Including C files for task1
     task1_exe.addIncludePath(b.path("clib"));
     task1_exe.addObjectFile(b.path("clib/context_win.obj"));
+    task1_exe.linkLibC();
 
     b.installArtifact(task1_exe);
 
@@ -132,6 +134,7 @@ pub fn build(b: *std.Build) void {
     // Including C files for task2
     task2_exe.addIncludePath(b.path("clib"));
     task2_exe.addObjectFile(b.path("clib/context_win.obj"));
+    task2_exe.linkLibC();
 
     b.installArtifact(task2_exe);
 
@@ -151,6 +154,7 @@ pub fn build(b: *std.Build) void {
     // Including C files for task3
     task3_exe.addIncludePath(b.path("clib"));
     task3_exe.addObjectFile(b.path("clib/context_win.obj"));
+    task3_exe.linkLibC();
 
     b.installArtifact(task3_exe);
 
@@ -213,6 +217,7 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    mod_tests.linkLibC();
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -223,6 +228,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    exe_tests.linkLibC();
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -240,6 +246,7 @@ pub fn build(b: *std.Build) void {
     });
     task1_tests.root_module.addIncludePath(b.path("clib"));
     task1_tests.root_module.addObjectFile(b.path("clib/context_win.obj"));
+    task1_tests.linkLibC();
 
     const run_task1_tests = b.addRunArtifact(task1_tests);
 
@@ -256,6 +263,7 @@ pub fn build(b: *std.Build) void {
     });
     task2_tests.root_module.addIncludePath(b.path("clib"));
     task2_tests.root_module.addObjectFile(b.path("clib/context_win.obj"));
+    task2_tests.linkLibC();
 
     const run_task2_tests = b.addRunArtifact(task2_tests);
 
@@ -272,6 +280,7 @@ pub fn build(b: *std.Build) void {
     });
     task3_tests.root_module.addIncludePath(b.path("clib"));
     task3_tests.root_module.addObjectFile(b.path("clib/context_win.obj"));
+    task3_tests.linkLibC();
 
     const run_task3_tests = b.addRunArtifact(task3_tests);
 

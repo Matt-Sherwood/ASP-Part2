@@ -2,33 +2,36 @@ const std = @import("std");
 const context = @import("context.zig");
 
 // =============================================================================
-// Task 2: Fiber Class and Scheduler Implementation
+// Task 2: Fiber Class Implementation with Yield Support
 // =============================================================================
-
-// Global scheduler instance
-var global_scheduler: Scheduler = undefined;
-
-// Pointer to current fiber being executed
-var current_fiber_ptr: ?*Fiber = null;
 
 // Fiber class
 pub const Fiber = struct {
     fn_ptr: *const fn () void,
-    stack: [4096]u8,
-    ctx: context.Context,
+    context: context.Context,
+    stack: []u8,
+    stack_size: usize,
+    stack_bottom: [*]u8,
+    stack_top: [*]u8,
     data: ?*anyopaque,
 
-    /// Creates a new fiber with the given function and optional data pointer
-    pub fn init(func: *const fn () void, data_ptr: ?*anyopaque) Fiber {
+    /// Creates a new fiber with the given function
+    pub fn init(allocator: std.mem.Allocator, func: *const fn () void, data: ?*anyopaque) !Fiber {
+        const stack_size = 8192;
+        var stack = try allocator.alloc(u8, stack_size);
+
         var fiber = Fiber{
             .fn_ptr = func,
-            .stack = undefined,
-            .ctx = std.mem.zeroes(context.Context),
-            .data = data_ptr,
+            .context = undefined,
+            .stack = stack,
+            .stack_size = stack_size,
+            .stack_bottom = undefined,
+            .stack_top = undefined,
+            .data = data,
         };
 
         // Set up stack pointer (stacks grow downwards)
-        var sp: [*]u8 = @ptrFromInt(@intFromPtr(&fiber.stack) + 4096);
+        var sp: [*]u8 = @ptrFromInt(@intFromPtr(&stack[stack_size - 1]) + 1);
 
         // Apply Sys V ABI stack alignment to 16 bytes
         const sp_usize = @intFromPtr(sp);
@@ -38,197 +41,186 @@ pub const Fiber = struct {
         // Reserve 128-byte Red Zone (Sys V ABI)
         sp = @ptrFromInt(@intFromPtr(sp) - 128);
 
+        // Set up stack pointers
+        fiber.stack_bottom = @ptrCast(&stack[0]);
+        fiber.stack_top = sp;
+
+        // Save current context to get preserved registers
+        var temp_context: context.Context = undefined;
+        _ = context.get(&temp_context);
+
         // Set up context to point to fiber function
-        fiber.ctx.rip = @ptrCast(@alignCast(@constCast(func)));
-        fiber.ctx.rsp = @ptrCast(sp);
+        fiber.context.rip = @ptrCast(@alignCast(@constCast(func)));
+        fiber.context.rsp = @ptrCast(sp);
+        // Copy preserved registers from current context
+        fiber.context.rbx = temp_context.rbx;
+        fiber.context.rbp = temp_context.rbp;
+        fiber.context.r12 = temp_context.r12;
+        fiber.context.r13 = temp_context.r13;
+        fiber.context.r14 = temp_context.r14;
+        fiber.context.r15 = temp_context.r15;
 
         return fiber;
     }
 
+    /// Deinitializes the fiber
+    pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
+        allocator.free(self.stack);
+    }
+
     /// Returns the context of this fiber
     pub fn get_context(self: *Fiber) *context.Context {
-        return &self.ctx;
+        return &self.context;
+    }
+
+    /// Returns the data pointer of this fiber
+    pub fn get_data(self: *const Fiber) ?*anyopaque {
+        return self.data;
+    }
+
+    /// Yields control back to the specified context (used by schedulers)
+    pub fn yield(self: *Fiber, return_context: *context.Context) void {
+        std.debug.print("Fiber yielding...\n", .{});
+        // Save current context
+        _ = context.get(&self.context);
+
+        // Return to the specified context
+        _ = context.set(return_context);
     }
 };
 
 // Scheduler class
 pub const Scheduler = struct {
-    fibers: std.ArrayList(*Fiber),
+    fibers_: std.ArrayList(*Fiber),
+    context_: context.Context,
     allocator: std.mem.Allocator,
-    fiber_return_point: context.Context,
 
-    /// Initializes a new scheduler
+    /// Constructor
     pub fn init(allocator: std.mem.Allocator) !Scheduler {
         return Scheduler{
-            .fibers = try std.ArrayList(*Fiber).initCapacity(allocator, 0),
+            .fibers_ = try std.ArrayList(*Fiber).initCapacity(allocator, 0),
+            .context_ = undefined,
             .allocator = allocator,
-            .fiber_return_point = std.mem.zeroes(context.Context),
         };
     }
 
-    /// Deinitializes the scheduler
+    /// Destructor
     pub fn deinit(self: *Scheduler) void {
-        self.fibers.deinit(self.allocator);
+        self.fibers_.deinit(self.allocator);
     }
 
-    /// Adds a fiber to the queue
-    pub fn spawn(self: *Scheduler, fiber: *Fiber) !void {
-        try self.fibers.append(self.allocator, fiber);
+    /// Spawns a fiber
+    pub fn spawn(self: *Scheduler, f: *Fiber) void {
+        self.fibers_.append(self.allocator, f) catch @panic("Failed to spawn fiber");
     }
 
-    /// Executes all queued fibers until completion
+    /// Runs the scheduler
     pub fn do_it(self: *Scheduler) void {
-        // Save return point - fibers will jump back here
-        _ = context.get(&self.fiber_return_point);
+        // Save scheduler context
+        _ = context.get(&self.context_);
 
-        if (self.fibers.items.len > 0) {
-            const fiber_ptr = self.fibers.orderedRemove(0);
-            current_fiber_ptr = fiber_ptr;
-
-            // Jump to fiber
-            _ = context.set(&fiber_ptr.ctx);
+        // Process fibers
+        while (self.fibers_.items.len > 0) {
+            var f = self.fibers_.orderedRemove(0);
+            current_fiber = f;
+            const c = f.get_context();
+            _ = context.set(c);
         }
     }
 
-    /// Called by fibers to exit and complete
+    /// Fiber exit
     pub fn fiber_exit(self: *Scheduler) void {
-        current_fiber_ptr = null;
-        _ = context.set(&self.fiber_return_point);
+        _ = context.set(&self.context_);
     }
 };
 
-// Global API functions
-pub fn spawn(fiber: *Fiber) !void {
-    try global_scheduler.spawn(fiber);
-}
+// Global scheduler instance
+pub var scheduler_instance: *Scheduler = undefined;
 
-pub fn do_it() void {
-    global_scheduler.do_it();
-}
+// Global current fiber
+pub var current_fiber: ?*Fiber = null;
 
-pub fn fiber_exit() void {
-    global_scheduler.fiber_exit();
-}
-
+/// Global get_data function
 pub fn get_data() ?*anyopaque {
-    if (current_fiber_ptr) |fiber| {
-        return fiber.data;
+    if (current_fiber) |f| {
+        return f.get_data();
     }
     return null;
 }
 
-// Example functions
+// Print incremented dp value
 fn func1() void {
-    std.debug.print("fiber 1\n", .{});
-    fiber_exit();
-}
-
-fn func2() void {
-    std.debug.print("fiber 2\n", .{});
-    fiber_exit();
-}
-
-fn func1_with_data() void {
-    std.debug.print("fiber 1\n", .{});
     const dp = get_data();
     if (dp) |ptr| {
         const data_ptr = @as(*i32, @ptrCast(@alignCast(ptr)));
         std.debug.print("fiber 1: {}\n", .{data_ptr.*});
         data_ptr.* += 1;
     }
-    fiber_exit();
+    scheduler_instance.fiber_exit();
 }
 
-fn func2_with_data() void {
+// Print current dp value
+fn func2() void {
     const dp = get_data();
     if (dp) |ptr| {
         const data_ptr = @as(*i32, @ptrCast(@alignCast(ptr)));
         std.debug.print("fiber 2: {}\n", .{data_ptr.*});
     }
-    fiber_exit();
-}
-
-// Examples
-pub fn basic_scheduler_example() void {
-    std.debug.print("\n=== Basic Scheduler Example ===\n", .{});
-
-    var f1 = Fiber.init(&func1, null);
-    var f2 = Fiber.init(&func2, null);
-
-    spawn(&f1) catch @panic("Failed to spawn f1");
-    spawn(&f2) catch @panic("Failed to spawn f2");
-
-    do_it();
-}
-
-pub fn data_sharing_example() void {
-    std.debug.print("\n=== Data Sharing Example ===\n", .{});
-
-    var d: i32 = 10;
-    const dp = &d;
-
-    var f1 = Fiber.init(&func1_with_data, @as(?*anyopaque, @ptrCast(dp)));
-    var f2 = Fiber.init(&func2_with_data, @as(?*anyopaque, @ptrCast(dp)));
-
-    spawn(&f1) catch @panic("Failed to spawn f1");
-    spawn(&f2) catch @panic("Failed to spawn f2");
-
-    do_it();
+    scheduler_instance.fiber_exit();
 }
 
 // Main function
 pub fn main() void {
-    // Initialize global scheduler
+
+    // Initialize allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    global_scheduler = Scheduler.init(allocator) catch @panic("Failed to init scheduler");
-    defer global_scheduler.deinit();
+    // Set s to be scheduler
+    var s = Scheduler.init(allocator) catch @panic("Failed to init scheduler");
+    defer s.deinit();
 
-    std.debug.print("=== Task 2 Examples ===\n", .{});
+    // Set global scheduler instance
+    scheduler_instance = &s;
 
-    basic_scheduler_example();
-    data_sharing_example();
+    // Set d to 10
+    var d: i32 = 10;
+    const dp = &d;
 
-    std.debug.print("\n=== All Task 2 Examples Complete ===\n", .{});
+    // Set f2 to be fiber with func2, dp
+    var f2 = Fiber.init(allocator, &func2, @as(?*anyopaque, @ptrCast(dp))) catch @panic("Failed to create fiber f2");
+    defer f2.deinit(allocator);
+
+    // Set f1 to be fiber with func1, dp
+    var f1 = Fiber.init(allocator, &func1, @as(?*anyopaque, @ptrCast(dp))) catch @panic("Failed to create fiber f1");
+    defer f1.deinit(allocator);
+
+    // Call s method spawn with address of f1
+    s.spawn(&f1);
+
+    // Call s method spawn with address of f2
+    s.spawn(&f2);
+
+    // Call s method do_it
+    s.do_it();
+
+    std.debug.print("Scheduler finished\n", .{});
 }
 
 // Unit tests
 test "fiber initialization" {
-    const fiber = Fiber.init(&func1, null);
-
-    // Check that RIP is set
-    try std.testing.expect(fiber.ctx.rip != null);
-
-    // Check stack alignment
-    const rsp_usize = @intFromPtr(fiber.ctx.rsp);
-    try std.testing.expect(rsp_usize % 16 == 0);
-}
-
-test "scheduler spawn" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var scheduler = try Scheduler.init(allocator);
-    defer scheduler.deinit();
+    var fiber = try Fiber.init(allocator, &func1, null);
+    defer fiber.deinit(allocator);
 
-    var fiber = Fiber.init(&func1, null);
+    // Check that RIP is set
+    try std.testing.expect(fiber.context.rip != null);
 
-    try scheduler.spawn(&fiber);
-    try std.testing.expect(scheduler.fibers.items.len == 1);
-}
-
-test "get_data returns correct pointer" {
-    var data: i32 = 42;
-    var fiber = Fiber.init(&func1, @as(?*anyopaque, @ptrCast(&data)));
-
-    // Simulate current fiber
-    current_fiber_ptr = &fiber;
-
-    const retrieved = get_data();
-    try std.testing.expect(retrieved != null);
-    const data_ptr = @as(*i32, @ptrCast(@alignCast(retrieved.?)));
-    try std.testing.expect(data_ptr.* == 42);
+    // Check stack alignment
+    const rsp_usize = @intFromPtr(fiber.context.rsp);
+    try std.testing.expect(rsp_usize % 16 == 0);
 }

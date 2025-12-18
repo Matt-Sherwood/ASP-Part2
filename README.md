@@ -1,38 +1,6 @@
-# Advanced Systems Programming - Part 2
-## Context Switching and Fiber Scheduler Implementation
 
-This project implements low-level context switching and a cooperative multitasking fiber scheduler in Zig, using custom x86-64 assembly for Windows.
 
----
-
-## Table of Contents
-- [Overview](#overview)
-- [Building and Running](#building-and-running)
-- [Task 1: Context Switching](#task-1-context-switching)
-- [Task 2: Fiber Scheduler](#task-2-fiber-scheduler)
-- [Task 3: Yield Support](#task-3-yield-support)
-- [Implementation Details](#implementation-details)
-- [Design Decisions](#design-decisions)
-
----
-
-## Overview
-
-This project demonstrates:
-1. **Low-level context switching** using custom assembly
-2. **Intra-function context switching** (within the same function)
-3. **Inter-function context switching** (fibers with separate stacks)
-4. **Cooperative multitasking** with a round-robin scheduler
-5. **Shared data** between fibers
-
-### Key Components
-
-- **Context Library** (`clib/context_win.s`): Windows x64 assembly for context switching
-- **Task 1** (`src/task1.zig`): Basic context switching demonstrations
-- **Task 2** (`src/task2.zig`): Fiber class and scheduler implementation
-- **Task 3** (`src/task3.zig`): Fiber yield support and advanced examples
-
----
+# Advanced Systems Programming
 
 ## Building and Running
 
@@ -56,737 +24,579 @@ zig build run-task2
 zig build run-task3
 ```
 
----
+## Task 1
 
-## Task 1: Context Switching
+Task one involves simply demonstrating context switching between fibers.
 
-### Part 1: Intra-function Context Switch
+```// Basic context switching example with volatile variable
+pub fn context_switch_example() void {
+    var x: u32 = 0;
+    var c: context.Context = undefined;
 
-Demonstrates saving and restoring execution state within the same function.
-
-**Key Concepts:**
-- Uses `get_context()` to save the current execution state
-- Uses `set_context()` to restore to a saved state
-- Volatile variable prevents compiler optimization
-
-**Output:**
-```
-a message
-a message
-```
-
-**How it works:**
-1. Save context at point A
-2. Print "a message"
-3. First pass: x==0, increment x, jump back to A
-4. Second pass: x==1, skip jump, continue
-
-### Part 2: Inter-function Context Switch (Fibers)
-
-Demonstrates switching execution to different functions with separate stacks.
-
-**Key Concepts:**
-- Each fiber has its own 4KB stack
-- Stack must be 16-byte aligned (Sys V ABI)
-- 128-byte Red Zone reservation required
-- Uses `swap_context()` to atomically save and switch
-
-**Implementation Details:**
-
-```zig
-// Stack setup
-var stack: [4096]u8 = undefined;
-var sp = stack_top_address;
-
-// Align to 16 bytes
-sp = sp & ~0xF;
-
-// Reserve Red Zone
-sp = sp - 128;
-
-// Create context
-fiber.ctx.rip = function_pointer;
-fiber.ctx.rsp = sp;
-```
-
----
-
-## Task 2: Fiber Scheduler
-
-### Architecture
-
-```
-┌─────────────────────────────────────────┐
-│            Scheduler                     │
-│  ┌───────────────────────────────────┐  │
-│  │   Fiber Queue (FIFO)              │  │
-│  │  [Fiber1] → [Fiber2] → [Fiber3]  │  │
-│  └───────────────────────────────────┘  │
-│                                          │
-│  do_it()  ──┐                           │
-│             ├──> Execute next fiber     │
-│  fiber_exit()─┘  Return to scheduler   │
-└─────────────────────────────────────────┘
-```
-
-### Fiber Class
-
-**Properties:**
-- `ctx`: Context containing RIP and RSP
-- `stack`: 4KB execution stack
-- `data`: Optional pointer for sharing data
-
-**Methods:**
-- `init(func, data_ptr)`: Create fiber with function and optional data
-- `get_context()`: Returns the fiber's context
-- `get_data()`: Returns the data pointer
-
-### Scheduler Class
-
-**Properties:**
-- `fibers`: Queue of fibers waiting to execute
-- `context_`: Scheduler's saved context
-- `current_fiber`: Currently executing fiber
-
-**Methods:**
-- `spawn(fiber)`: Add fiber to execution queue
-- `do_it()`: Execute all queued fibers
-- `fiber_exit()`: Return control to scheduler
-
-### Global API Functions
-
-```zig
-spawn(&fiber)      // Add fiber to global scheduler
-do_it()            // Run the scheduler
-fiber_exit()       // Exit current fiber
-get_data()         // Get current fiber's data
-```
-
-### Example Usage
-
-#### Basic Fibers
-
-```zig
-fn fiber_func() void {
-    std.debug.print("Hello from fiber!\n", .{});
-    fiber_exit();
-}
-
-var f1 = Fiber.init(&fiber_func, null);
-spawn(&f1);
-do_it();
-```
-
-#### Fibers with Shared Data
-
-```zig
-fn increment_fiber() void {
-    if (get_data()) |data| {
-        var counter: *i32 = @ptrCast(@alignCast(data));
-        counter.* += 1;
-        std.debug.print("Counter: {d}\n", .{counter.*});
+    _ = context.get(&c); // Save context here
+    std.debug.print("a message\n", .{});
+    if (x == 0) {
+        x += 1;
+        _ = context.set(&c); // Jump back
     }
-    fiber_exit();
+}
+```
+
+This function demonstrates the fundamental concept of context switching by capturing the current execution state and then restoring it at a later point, effectively creating a controlled loop that outputs a message twice through careful manipulation of the CPU context.
+
+- Functions representing fibers
+
+```// Fiber function that yields back to main
+pub fn foo() void {
+    std.debug.print("you called foo\n", .{});
+    // Yield back to main instead of exiting
+    context.fiber_exit();
 }
 
-var counter: i32 = 10;
-var f1 = Fiber.init(&increment_fiber, @ptrCast(&counter));
-var f2 = Fiber.init(&increment_fiber, @ptrCast(&counter));
-
-spawn(&f1);
-spawn(&f2);
-do_it();
-
-// Output:
-// Counter: 11
-// Counter: 12
-```
-
----
-
-## Task 3: Yield Support
-
-### Overview
-
-Extends the fiber scheduler with **voluntary yield** support, allowing fibers to pause execution and later resume from the same point. This enables:
-- Producer-consumer patterns
-- Pipeline stages with data transformation
-- Complex workflows where fibers yield control at specific points
-
-### Key Concepts
-
-**Fiber State Machine:**
-```
-    spawn()           
-      ↓
-   [ready] 
-      ↓
-   do_it() 
-      ↓
-  [running]
-      ├─→ fiber_exit() → [completed] (done)
-      └─→ yield()      → [suspended] (can resume)
-           ↓
-         do_it() (on next iteration)
-           ↓
-        [running] (resumed)
-```
-
-### New API Functions
-
-```zig
-yield()                // Pause current fiber, return control to scheduler
-do_it()                // Run all ready/suspended fibers until completion
-```
-
-### Enhanced Scheduler
-
-The scheduler now:
-1. Tracks fiber states (ready, running, suspended, completed)
-2. Handles both completion (fiber_exit) and suspension (yield) 
-3. Re-queues suspended fibers for resumption
-4. Continues until all fibers complete
-
-### Example 1: Basic Yield
-
-```zig
-fn fiber1() void {
-    std.debug.print("fiber 1 before\n", .{});
-    yield();
-    std.debug.print("fiber 1 after\n", .{});
-    fiber_exit();
+// Another fiber function
+pub fn goo() void {
+    std.debug.print("you called goo\n", .{});
+    // Yield back to main instead of exiting
+    context.fiber_exit();
 }
+```
 
-fn fiber2() void {
-    std.debug.print("fiber 2\n", .{});
-    fiber_exit();
+These two fiber functions serve as examples of cooperative multitasking, where each function performs its designated task of printing a message and then voluntarily returns control back to the main execution context as to not terminate abruptly.
+
+- Setting up a fiber
+
+```// Allocate space for stack
+    var data1: [4096]u8 = undefined;
+
+    // Stacks grow downwards
+    var sp1: [*]u8 = @ptrFromInt(@intFromPtr(&data1) + 4096);
+
+    // Apply Sys V ABI stack alignment to 16 bytes
+    const sp1_usize = @intFromPtr(sp1);
+    const aligned_sp1_usize = sp1_usize & ~@as(usize, 15);
+    sp1 = @ptrFromInt(aligned_sp1_usize);
+
+    // Reserve 128-byte Red Zone (Sys V ABI)
+    sp1 = @ptrFromInt(@intFromPtr(sp1) - 128);
+
+    // Create empty context
+    var c1: context.Context = std.mem.zeroes(context.Context);
+    c1.rip = @ptrCast(@alignCast(@constCast(&foo))); // Assigned IP to foo
+    c1.rsp = @ptrCast(sp1);
+```
+
+This code segment handles the meticulous setup of a fiber's execution environment, carefully allocating stack space while ensuring proper alignment according to the System V ABI specifications for x86-64 architecture, and then initializing the context structure with the appropriate function pointer and stack pointer values.
+
+- The context switch
+
+``` // Save main context before switching -> Allows fiber_exits to return to main fn
+    context.save_main();
+
+    // Jump to foo
+    _ = context.set(&c1);
+
+    // Jump to goo
+    _ = context.set(&c2);
+```
+
+This section preserves the main function's execution context to enable proper return flow when fibers complete their execution, then proceeds to perform sequential context switches to execute first the foo fiber and subsequently the goo fiber in an orderly manner.
+
+- Main
+```pub fn main() void {
+    std.debug.print("Context Switch Example:\n", .{});
+    context_switch_example();
+
+    std.debug.print("\nTwo Fiber Example:\n", .{});
+    two_fiber_example();
 }
-
-var f1 = Fiber.init(&fiber1, null);
-var f2 = Fiber.init(&fiber2, null);
-
-spawn(&f1);
-spawn(&f2);
-do_it();
 ```
 
-**Output:**
+This main function serves as the primary entry point, orchestrating the demonstration of both basic context switching capabilities and the more complex scenario of managing multiple fibers that cooperate through voluntary context switching mechanisms.
+
 ```
-fiber 1 before
-fiber 2
-fiber 1 after
-```
+Output:
 
-**Execution Flow:**
-1. Schedule f1, then f2
-2. Execute f1: prints "before", then yields
-3. Execute f2: prints "2", then exits
-4. Resume f1: prints "after", then exits
+![Task 1 Output](img/task1.PNG)
 
-### Example 2: Producer-Consumer
+## Task 2
 
-```zig
-var shared_data: i32 = 0;
+Task 2 involves creating a class for both the a Fiber and Scheduler implementation, and demonstrating functionality.
 
-fn producer() void {
-    for (0..3) |i| {
-        if (get_data()) |data| {
-            var value: *i32 = @ptrCast(@alignCast(data));
-            value.* = @intCast(i * 10);
-            std.debug.print("Produced: {d}\n", .{value.*});
-        }
-        yield();
-    }
-    fiber_exit();
-}
-
-fn consumer() void {
-    for (0..3) |_| {
-        if (get_data()) |data| {
-            var value: *i32 = @ptrCast(@alignCast(data));
-            std.debug.print("Consumed: {d}\n", .{value.*});
-        }
-        yield();
-    }
-    fiber_exit();
-}
-
-var prod = Fiber.init(&producer, @ptrCast(&shared_data));
-var cons = Fiber.init(&consumer, @ptrCast(&shared_data));
-
-spawn(&prod);
-spawn(&cons);
-do_it();
-```
-
-**Output:**
-```
-Produced: 0
-Consumed: 0
-Produced: 10
-Consumed: 10
-Produced: 20
-Consumed: 20
-```
-
-### Example 3: Pipeline Stages
-
-```zig
-var shared_value: i32 = 10;
-
-fn stage1() void {
-    if (get_data()) |data| {
-        var val: *i32 = @ptrCast(@alignCast(data));
-        val.* *= 2;  // Double the value
-        std.debug.print("Stage 1: {d}\n", .{val.*});
-    }
-    fiber_exit();
-}
-
-fn stage2() void {
-    if (get_data()) |data| {
-        var val: *i32 = @ptrCast(@alignCast(data));
-        val.* += 5;  // Add 5
-        std.debug.print("Stage 2: {d}\n", .{val.*});
-    }
-    fiber_exit();
-}
-
-var s1 = Fiber.init(&stage1, @ptrCast(&shared_value));
-var s2 = Fiber.init(&stage2, @ptrCast(&shared_value));
-
-spawn(&s1);
-spawn(&s2);
-do_it();
-```
-
-**Output:**
-```
-Stage 1: 20
-Stage 2: 25
-```
-
-### Implementation Details
-
-**FiberState Enum:**
-```zig
-const FiberState = enum {
-    ready,       // Ready to run
-    running,     // Currently executing
-    suspended,   // Yielded, waiting to resume
-    completed,   // Finished execution
-};
-```
-
-**Fiber Structure Enhancement:**
-```zig
-pub struct Fiber {
-    fn: *const fn() void,
-    stack: [STACK_SIZE]u8,
-    ctx: Context,
+- Fiber Class
+```pub const Fiber = struct {
+    fn_ptr: *const fn () void,
+    context: context.Context,
+    stack: []u8,
+    stack_size: usize,
+    stack_bottom: [*]u8,
+    stack_top: [*]u8,
     data: ?*anyopaque,
-    state: FiberState,        // NEW: Track state
-    resume_point: ?Context,   // NEW: Save context at yield point
-};
+
+    /// Creates a new fiber with the given function
+    pub fn init(allocator: std.mem.Allocator, func: *const fn () void, data: ?*anyopaque) !Fiber {
+        const stack_size = 8192;
+        var stack = try allocator.alloc(u8, stack_size);
+
+        var fiber = Fiber{
+            .fn_ptr = func,
+            .context = undefined,
+            .stack = stack,
+            .stack_size = stack_size,
+            .stack_bottom = undefined,
+            .stack_top = undefined,
+            .data = data,
+        };
 ```
 
-**Yield Implementation:**
+This Fiber struct represents the core abstraction for lightweight cooperative threads, encapsulating all the essential components including the function to execute, CPU register state for context switching, dedicated stack memory for local variables, and an optional data pointer to facilitate communication between different fibers during execution.
 
-When a fiber calls `yield()`:
-1. Current context is captured (where to resume)
-2. Scheduler context is restored (jump back to scheduler)
-3. Fiber is re-queued in the ready queue
-4. On next iteration, scheduler resumes fiber from saved context
+- Methods
+```    /// Deinitializes the fiber
+    pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
+        allocator.free(self.stack);
+    }
 
-**Scheduler Loop with Yield:**
+    /// Returns the context of this fiber
+    pub fn get_context(self: *Fiber) *context.Context {
+        return &self.context;
+    }
+
+    /// Returns the data pointer of this fiber
+    pub fn get_data(self: *const Fiber) ?*anyopaque {
+        return self.data;
+    }
+
+    /// Yields control back to the specified context (used by schedulers)
+    pub fn yield(self: *Fiber, return_context: *context.Context) void {
+        std.debug.print("Fiber yielding...\n", .{});
+        // Save current context
+        _ = context.get(&self.context);
+
+        // Return to the specified context
+        _ = context.set(return_context);
+    }
 ```
-loop:
-  if queue is empty:
-    break
-  
-  fiber = queue.pop()
-  
-  if fiber.state == ready:
-    fiber.state = running
-    set_context(fiber.ctx)  // Jump to fiber function
-  
-  else if fiber.state == suspended:
-    fiber.state = running
-    set_context(fiber.resume_point)  // Resume from yield point
+
+These methods provide the essential interface for fiber management, including proper cleanup of allocated resources, access to the fiber's execution context for scheduling purposes, retrieval of shared data, and the critical yielding mechanism that enables cooperative multitasking by saving the current state and transferring control to another execution context.
+
+- Scheduler Class
+```pub const Scheduler = struct {
+    fibers_: std.ArrayList(*Fiber),
+    context_: context.Context,
+    allocator: std.mem.Allocator,
+
+    /// Constructor
+    pub fn init(allocator: std.mem.Allocator) !Scheduler {
+        return Scheduler{
+            .fibers_ = try std.ArrayList(*Fiber).initCapacity(allocator, 0),
+            .context_ = undefined,
+            .allocator = allocator,
+        };
+    }
 ```
 
----
+This Scheduler struct serves as the central coordinator for fiber execution, maintaining a queue of fibers awaiting execution along with its own execution context to facilitate the round-robin scheduling of cooperative tasks in an orderly and predictable manner.
 
-## Task 3: Yield Support
+- Scheduler Methods
+```    /// Destructor
+    pub fn deinit(self: *Scheduler) void {
+        self.fibers_.deinit(self.allocator);
+    }
 
-**Task 3** extends the fiber system with cooperative yielding, allowing fibers to pause execution and resume later.
+    /// Spawns a fiber
+    pub fn spawn(self: *Scheduler, f: *Fiber) void {
+        self.fibers_.append(self.allocator, f) catch @panic("Failed to spawn fiber");
+    }
 
-### Key Features
+    /// Runs the scheduler
+    pub fn do_it(self: *Scheduler) void {
+        // Save scheduler context
+        _ = context.get(&self.context_);
 
-- **Cooperative Yielding**: Fibers can voluntarily yield control back to the scheduler
-- **State Preservation**: Fiber execution state is maintained across yields
-- **Multiple Yields**: Fibers can yield multiple times
-- **Data Sharing**: Continued support for shared data between fibers
+        // Process fibers
+        while (self.fibers_.items.len > 0) {
+            var f = self.fibers_.orderedRemove(0);
+            current_fiber = f;
+            const c = f.get_context();
+            _ = context.set(c);
+        }
+    }
 
-### Implementation
+    /// Fiber exit
+    pub fn fiber_exit(self: *Scheduler) void {
+        _ = context.set(&self.context_);
+    }
+```
 
-**Fiber Class Extensions:**
-- `yield_count: u32` - Tracks number of yields for resumption logic
-- State-based resumption using yield counters
+These scheduler methods collectively implement the core functionality for managing the fibers, including proper resource cleanup, adding new fibers to the execution queue, running the round-robin scheduling algorithm until all fibers complete, and providing a mechanism for fibers to return control back to the scheduler when they finish their execution.
 
-**Scheduler Extensions:**
-- `fiber_yield()`: Re-queue current fiber and return to scheduler
-- `yield()`: Global API for yielding
+```
+- Get Data from Fiber
 
-### Example Usage
+```/// Global get_data function
+pub fn get_data() ?*anyopaque {
+    if (current_fiber) |f| {
+        return f.get_data();
+    }
+    return null;
+    
+```
 
-#### Basic Yield
+This global function provides a convenient interface for accessing the data pointer associated with the currently executing fiber, enabling different fibers to share and exchange information during their cooperative execution within the scheduling framework.
 
-```zig
+
+- DP Functions
+
+```
+// Print incremented dp value
+fn func1() void {
+    const dp = get_data();
+    if (dp) |ptr| {
+        const data_ptr = @as(*i32, @ptrCast(@alignCast(ptr)));
+        std.debug.print("fiber 1: {}\n", .{data_ptr.*});
+        data_ptr.* += 1;
+    }
+    scheduler_instance.fiber_exit();
+}
+
+// Print current dp value
+fn func2() void {
+    const dp = get_data();
+    if (dp) |ptr| {
+        const data_ptr = @as(*i32, @ptrCast(@alignCast(ptr)));
+        std.debug.print("fiber 2: {}\n", .{data_ptr.*});
+    }
+    scheduler_instance.fiber_exit();
+}
+```
+
+These two functions demonstrate the practical application of data sharing between fibers, where the first function both displays and modifies a shared integer value, while the second function simply reads and displays the current value, illustrating how cooperative fibers can communicate and coordinate through shared memory locations.
+
+```
+- Main
+
+```
+pub fn main() void {
+    std.debug.print("=== Task 2: Fiber Class Example ===\n", .{});
+
+    // Initialize allocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Set s to be scheduler
+    var s = Scheduler.init(allocator) catch @panic("Failed to init scheduler");
+    defer s.deinit();
+
+    // Set global scheduler instance
+    scheduler_instance = &s;
+
+    // Set d to 10
+    var d: i32 = 10;
+    const dp = &d;
+
+    // Set f2 to be fiber with func2, dp
+    var f2 = Fiber.init(allocator, &func2, @as(?*anyopaque, @ptrCast(dp))) catch @panic("Failed to create fiber f2");
+    defer f2.deinit(allocator);
+
+    // Set f1 to be fiber with func1, dp
+    var f1 = Fiber.init(allocator, &func1, @as(?*anyopaque, @ptrCast(dp))) catch @panic("Failed to create fiber f1");
+    defer f1.deinit(allocator);
+
+    // Call s method spawn with address of f1
+    s.spawn(&f1);
+
+    // Call s method spawn with address of f2
+    s.spawn(&f2);
+
+    // Call s method do_it
+    s.do_it();
+
+    std.debug.print("Scheduler finished\n", .{});
+}
+```
+
+This main function orchestrates a complete demonstration of the fiber scheduling system, initializing the necessary memory allocator, creating a scheduler instance, setting up two fibers that share a common data variable, spawning them for execution, and running the scheduler until all fibers have completed their cooperative tasks.
+
+```
+Output:
+
+![Task 2 Output](img/task2.PNG)
+
+## Task 3
+
+Task 3 concerns the use of yielding within fibers, as such the scheduler can switch between them without their respective save states being lossed. 
+
+- Threadpool Class
+
+```
+pub const ThreadPool = struct {
+    fibers_: std.ArrayList(*Fiber),
+    yielded_fibers: std.ArrayList(*Fiber),
+    context_: context.Context,
+    allocator: std.mem.Allocator,
+
+    /// Constructor
+    pub fn init(allocator: std.mem.Allocator) !ThreadPool {
+        return ThreadPool{
+            .fibers_ = try std.ArrayList(*Fiber).initCapacity(allocator, 10),
+            .yielded_fibers = try std.ArrayList(*Fiber).initCapacity(allocator, 10),
+            .context_ = undefined,
+            .allocator = allocator,
+        };
+    }
+```
+
+This ThreadPool struct represents an advanced scheduling mechanism that maintains separate queues for new fibers awaiting initial execution and fibers that have voluntarily yielded control, enabling more sophisticated cooperative multitasking scenarios where execution can be paused and resumed at will.
+
+- Threadpool Methods
+
+```
+    /// Destructor
+    pub fn deinit(self: *ThreadPool) void {
+        self.fibers_.deinit(self.allocator);
+        self.yielded_fibers.deinit(self.allocator);
+    }
+
+    /// Spawn a fiber (task) on the pool
+    pub fn spawn(self: *ThreadPool, f: *Fiber) !void {
+        try self.fibers_.append(self.allocator, f);
+    }
+
+    /// Cooperatively yields the current fiber back to the thread pool
+    pub fn fiber_yield(self: *ThreadPool) void {
+        if (current_fiber) |fiber| {
+            // Re-queue the current fiber
+            self.yielded_fibers.append(std.heap.page_allocator, fiber) catch @panic("Failed to yield fiber");
+
+            // Swap context: save current to fiber, switch to thread pool
+            _ = context.swap(&fiber.context, &self.context_);
+        }
+    }
+
+    /// Terminates the current fiber and returns control to the thread pool
+    pub fn fiber_exit(self: *ThreadPool) void {
+        if (current_fiber) |_| {
+            // Clear current fiber (it's done)
+            current_fiber = null;
+
+            // Switch back to thread pool context (no need to save current)
+            _ = context.set(&self.context_);
+        }
+    }
+
+    /// Run the thread pool
+    pub fn run(self: *ThreadPool) !void {
+        // Set global thread pool instance
+        thread_pool_instance = self;
+
+        // Save thread pool context
+        _ = context.get(&self.context_);
+
+        // Run the scheduler with yield support
+        self.do_it_with_yields();
+    }
+
+    /// Runs the cooperative scheduler that handles both new and yielded fibers
+    fn do_it_with_yields(self: *ThreadPool) void {
+        while (self.fibers_.items.len > 0 or self.yielded_fibers.items.len > 0) {
+            // Process fibers in order: new fibers first, then yielded ones
+            if (self.fibers_.items.len > 0) {
+                const f = self.fibers_.orderedRemove(0);
+                current_fiber = f;
+                const c = f.get_context();
+                _ = context.set(c);
+            } else if (self.yielded_fibers.items.len > 0) {
+                const f = self.yielded_fibers.orderedRemove(0);
+                current_fiber = f;
+                const c = f.get_context();
+                _ = context.set(c);
+            }
+        }
+    }
+```
+
+These ThreadPool methods implement the sophisticated cooperative scheduling logic, providing mechanisms for spawning new fibers, handling voluntary yielding with state preservation, managing fiber termination, and executing a priority-based scheduling algorithm that processes new fibers first before resuming previously yielded ones.
+
+```
+- Global Functions
+
+```
+// Global API for fiber operations
+/// Cooperatively yields the current fiber
+pub fn yield() void {
+    std.debug.print("Global yield called\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_yield();
+    }
+}
+
+/// Retrieves the data pointer associated with the current fiber
+pub fn get_data() ?*anyopaque {
+    if (current_fiber) |f| {
+        return f.get_data();
+    }
+    return null;
+}
+```
+
+These global functions provide the essential API for cooperative fiber operations, offering a convenient interface for fibers to voluntarily yield control back to the thread pool and access shared data associated with the currently executing fiber, facilitating communication and coordination between different cooperative tasks.
+```
+- Main
+```
+pub fn main() void {
+
+    // Initialize allocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Example 1: Basic thread pool
+    std.debug.print("\n--- Example 1: Basic Thread Pool ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
+
+        var t1 = Fiber.init(allocator, &task1, null) catch @panic("Failed to create task1");
+        defer t1.deinit(allocator);
+        var t2 = Fiber.init(allocator, &task2_func, null) catch @panic("Failed to create task2");
+        defer t2.deinit(allocator);
+        var t3 = Fiber.init(allocator, &task3_func, null) catch @panic("Failed to create task3");
+        defer t3.deinit(allocator);
+
+        pool.spawn(&t1) catch @panic("Failed to spawn task1");
+        pool.spawn(&t2) catch @panic("Failed to spawn task2");
+        pool.spawn(&t3) catch @panic("Failed to spawn task3");
+
+        pool.run() catch @panic("Failed to run thread pool");
+    }
+
+    // Example 2: Yield demonstration (from pseudocode)
+    std.debug.print("\n--- Example 2: Fiber Yield ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
+        thread_pool_instance = &pool;
+
+        var fiber1 = Fiber.init(allocator, &f1, null) catch @panic("Failed to create f1");
+        defer fiber1.deinit(allocator);
+        var fiber2 = Fiber.init(allocator, &f2, null) catch @panic("Failed to create f2");
+        defer fiber2.deinit(allocator);
+
+        pool.spawn(&fiber1) catch @panic("Failed to spawn f1");
+        pool.spawn(&fiber2) catch @panic("Failed to spawn f2");
+
+        pool.run() catch @panic("Failed to run thread pool");
+    }
+
+    // Example 3: Data sharing with yield
+    std.debug.print("\n--- Example 3: Data Sharing with Yield ---\n", .{});
+    {
+        var pool = ThreadPool.init(allocator) catch @panic("Failed to init thread pool");
+        defer pool.deinit();
+        thread_pool_instance = &pool;
+
+        var shared_data = SharedData{ .value = 0 };
+
+        var prod = Fiber.init(allocator, &producer, @as(?*anyopaque, @ptrCast(&shared_data))) catch @panic("Failed to create producer");
+        defer prod.deinit(allocator);
+        var cons = Fiber.init(allocator, &consumer, @as(?*anyopaque, @ptrCast(&shared_data))) catch @panic("Failed to create consumer");
+        defer cons.deinit(allocator);
+
+        pool.spawn(&prod) catch @panic("Failed to spawn producer");
+        pool.spawn(&cons) catch @panic("Failed to spawn consumer");
+
+        pool.run() catch @panic("Failed to run thread pool");
+    }
+}
+```
+
+This comprehensive main function demonstrates three distinct cooperative multitasking scenarios, showcasing basic thread pool execution, the mechanics of fiber yielding with state preservation, and sophisticated data sharing patterns between cooperating fibers that voluntarily yield and resume execution.
+```
+
+- Example 1 Functions:
+```
+fn task1() void {
+    std.debug.print("Instruction 1 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+
+fn task2_func() void {
+    std.debug.print("Instruction 2 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+
+fn task3_func() void {
+    std.debug.print("Instruction 3 executing\n", .{});
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
+}
+```
+
+These simple task functions represent the basic building blocks of cooperative execution, each performing a minimal operation of printing an execution message before voluntarily terminating and returning control back to the thread pool management system.
+```
+
+- Example 2 Functions:
+```
+// Yield demonstration functions
 fn f1() void {
     std.debug.print("fiber 1 before\n", .{});
     yield();
     std.debug.print("fiber 1 after\n", .{});
-    fiber_exit();
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
 }
 
 fn f2() void {
     std.debug.print("fiber 2\n", .{});
-    fiber_exit();
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
 }
-
-// Output:
-// fiber 1 before
-// fiber 2
-// fiber 1 after
 ```
 
-#### Producer-Consumer with Yield
-
-```zig
-const SharedCounter = struct { value: i32 };
-
+These functions illustrate the fundamental concept of cooperative yielding, where the first fiber voluntarily pauses its execution mid-operation and can later resume from that exact point, while the second fiber demonstrates straightforward completion without yielding, highlighting the flexibility of the cooperative scheduling approach.
+```
+- Example 3 Functions
+```
 fn producer() void {
-    if (get_data()) |data| {
-        var counter: *SharedCounter = @ptrCast(@alignCast(data));
-        counter.value = 42;
-        std.debug.print("Producer: set value to {d}\n", .{counter.value});
-        yield();
-        std.debug.print("Producer: value is {d}\n", .{counter.value});
+    const data = get_data();
+    if (data) |ptr| {
+        const shared = @as(*SharedData, @ptrCast(@alignCast(ptr)));
+        shared.value = 42;
+        std.debug.print("Producer: set value to {}\n", .{shared.value});
+        yield(); // Yield to let consumer run
+        std.debug.print("Producer: value is now {}\n", .{shared.value});
     }
-    fiber_exit();
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
 }
 
 fn consumer() void {
     yield(); // Let producer run first
-    if (get_data()) |data| {
-        var counter: *SharedCounter = @ptrCast(@alignCast(data));
-        std.debug.print("Consumer: read value {d}\n", .{counter.value});
+    const data = get_data();
+    if (data) |ptr| {
+        const shared = @as(*SharedData, @ptrCast(@alignCast(ptr)));
+        std.debug.print("Consumer: read value {}\n", .{shared.value});
+        shared.value += 10;
+        std.debug.print("Consumer: modified value to {}\n", .{shared.value});
     }
-    fiber_exit();
+    if (thread_pool_instance) |tp| {
+        tp.fiber_exit();
+    }
 }
 ```
-
-#### Multiple Yields
-
-```zig
-fn multi_yield_fiber() void {
-    std.debug.print("Start\n", .{});
-    yield();
-    std.debug.print("Middle\n", .{});
-    yield();
-    std.debug.print("End\n", .{});
-    fiber_exit();
-}
-```
-
----
-
-## Implementation Details
-
-### Windows x64 Calling Convention
-
-The custom assembly (`context_win.s`) uses Windows x64 calling convention:
-- First argument in `%rcx`
-- Second argument in `%rdx`
-- Stack must be 16-byte aligned
-- Return address pushed by CALL instruction
-
-### Context Structure
-
-```c
-struct Context {
-    void *rip;  // Instruction pointer
-    void *rsp;  // Stack pointer
-    void *rbx;  // Callee-saved registers
-    void *rbp;
-    void *r12;
-    void *r13;
-    void *r14;
-    void *r15;
-};
-```
-
-### Context Switching Functions
-
-1. **get_context(Context *c)**
-   - Saves current execution state
-   - Stores return address (RIP)
-   - Stores stack pointer (RSP)
-   - Saves callee-saved registers
-
-2. **set_context(Context *c)**
-   - Restores execution state
-   - Loads stack pointer
-   - Loads registers
-   - Jumps to saved RIP
-
-3. **swap_context(Context *out, Context *in)**
-   - Atomically saves current context to `out`
-   - Switches to context `in`
-   - Prevents race conditions
-
----
-
-## Design Decisions
-
-### Why is the scheduler global?
-
-The scheduler is made global (`global_scheduler`) for several important reasons:
-
-1. **Fiber Exit Mechanism**
-   - Fibers need to call `fiber_exit()` to return control
-   - fiber_exit() must access the scheduler to restore its context
-   - Without a global scheduler, each fiber would need to store a scheduler pointer
-
-2. **API Simplicity**
-   - Global functions `spawn()`, `do_it()`, and `fiber_exit()` provide clean API
-   - Users don't need to pass scheduler reference everywhere
-   - Matches common patterns in cooperative multitasking systems
-
-3. **Stack Management**
-   - Fibers have their own stacks, separate from main stack
-   - Cannot pass scheduler by reference through stack when switching contexts
-   - Global access ensures scheduler is always reachable
-
-4. **Single Scheduler Paradigm**
-   - Most applications need only one scheduler
-   - Multiple schedulers would complicate fiber management
-   - Global instance matches the typical use case
-
-### Alternative Approaches Considered
-
-1. **Passing scheduler pointer to each fiber**
-   - Would require storing pointer in fiber structure
-   - Adds complexity and memory overhead
-   - Still doesn't solve the problem of accessing it from fiber functions
-
-2. **Thread-local storage**
-   - Could use TLS for multi-threaded scenarios
-   - Overkill for single-threaded cooperative multitasking
-   - Adds unnecessary complexity
-
-### Round-Robin Scheduling
-
-The scheduler uses FIFO (First-In-First-Out) semantics:
-- Fibers execute in the order they were spawned
-- Each fiber runs to completion (no preemption)
-- Simple and predictable behavior
-
-**Execution Flow:**
-```
-spawn(f1) → spawn(f2) → spawn(f3) → do_it()
-              ↓
-         [f1] → [f2] → [f3]
-              ↓
-         Execute f1 (runs to completion)
-              ↓
-         Execute f2 (runs to completion)
-              ↓
-         Execute f3 (runs to completion)
-              ↓
-         Return to main
-```
-
-### Stack Alignment
-
-**Why 16-byte alignment?**
-- Required by Sys V ABI and x86-64 calling convention
-- Ensures proper memory alignment for SIMD instructions
-- SSE instructions (movaps, etc.) require 16-byte alignment
-- Failure to align can cause segmentation faults
-
-**Why 128-byte Red Zone?**
-- Sys V ABI reserves 128 bytes below stack pointer
-- Functions can use this space for temporary data
-- No need to adjust SP for small stack allocations
-- Must be preserved when switching contexts
-
-### Data Sharing Between Fibers
-
-Fibers can share data through pointers:
-- Passed during fiber creation
-- Accessed via `get_data()`
-- Allows communication between fibers
-- Enables shared state management
-
-**Example Use Cases:**
-- Counters
-- Shared buffers
-- Configuration objects
-- Communication channels
-
----
-
-## Test Results
-
-### Task 1 Output
+These functions implement a classic producer-consumer pattern using cooperative yielding, where the producer sets an initial value and yields control, allowing the consumer to read and modify the shared data before the producer resumes to observe the changes, demonstrating sophisticated coordination between cooperating fibers.
 
 ```
-=== Part 1: Intra-function context switch ===
-a message
-a message
-Part 1 complete (x=1)
+Output:
 
-=== Part 2: Fiber with separate stack ===
-Switching to foo...
-you called foo
-Back from foo
-
-=== Part 2 Extended: Multiple fibers ===
-Switching to goo...
-you called goo
-Back from goo
-
-=== All context switches complete ===
+![Task 3 Output](img/task3.PNG)
 ```
-
-### Task 2 Output
-
-```
-=== Example 1: Basic Fibers ===
-fiber 1
-fiber 2
-
-=== Example 2: Multiple Fibers ===
-fiber 3
-fiber 4
-fiber 1
-fiber 2
-
-=== Example 3: Fibers with Shared Data ===
-fiber 1
-fiber 1: 10
-fiber 2: 11
-
-=== Example 4: Chain of Fibers with Data ===
-fiber 1
-fiber 1: 100
-fiber 2: 101
-fiber 1
-fiber 1: 101
-
-=== All examples complete ===
-```
-
-### Task 3 Output
-
-```
-=== Example 1: Basic Yield ===
-fiber 1 before
-fiber 1 after
-
-=== Example 2: Producer-Consumer ===
-[Producer] Starting to produce...
-[Consumer] Waiting for data...
-Final counter value: 0
-
-=== Example 3: Pipeline Stages ===
-[Stage 1] Starting
-[Stage 1] Processing: value = 10
-[Stage 2] Starting
-[Stage 2] Doubled: value = 20
-[Stage 3] Starting
-[Stage 3] Final: value = 25
-Pipeline final value: 25
-
-=== Example 4: Multiple Yields ===
-[Multi] Start
-fiber 2
-[Multi] Start
-```
-
-**Implementation Status:**
-
-✅ **Working:**
-- Fibers yield successfully (pause execution and return control to scheduler)
-- First fiber can resume and execute code after yield point
-- Scheduler properly manages fiber queue and re-queuing
-- Examples 1-3 demonstrate yield behavior
-
-⚠️ **Partial/In-Progress:**
-- Multiple fiber scheduling with yields has context synchronization issues
-- After first fiber yields/resumes, subsequent fibers may encounter stack corruption
-- Requires more sophisticated context management for complex yield scenarios
-
-**Technical Challenges:**
-The yield implementation uses context saving via `get_context()` and `set_context()` calls. The complexity arises from:
-1. Saving fiber context at the exact yield point (not in scheduler code)
-2. Maintaining valid stack pointers across multiple context switches
-3. Ensuring proper return points in the scheduler loop for each fiber iteration
-4. Coordinating resumption of multiple fibers in FIFO order
-
-This is a known limitation of the simple context-switch approach. Production systems typically use more sophisticated mechanisms like:
-- Explicit stack frame management per fiber
-- Separate resume stacks
-- Dedicated yield trampolines
-- Return address prediction
-
----
-
-## Future Enhancements
-
-Possible extensions to this implementation:
-
-1. **Improved Scheduling**
-   - Priority-based scheduling
-   - Work-stealing schedulers
-   - Load balancing across cores
-
-2. **Advanced Patterns**
-   - Channel-based communication between fibers
-   - Synchronization primitives (mutexes, semaphores)
-   - Barrier synchronization
-
-3. **Multi-core Support**
-   - Parallel fiber execution on multiple cores
-   - Thread-safe scheduler
-   - Work distribution
-
-4. **Exception Handling**
-   - Proper cleanup on fiber failure
-   - Exception propagation across fibers
-   - Resource management (RAII)
-
-5. **Cross-platform Support**
-   - Linux (System V ABI)
-   - macOS (different calling convention)
-   - ARM architectures
-   - WebAssembly
-
----
-
-## References
-
-- Sys V ABI x86-64 Specification
-- Windows x64 Calling Convention
-- Zig Language Reference
-- Context Switching in Operating Systems
-
----
-
-## Author
-
-Matt - Advanced Systems Programming Course
-Date: December 11, 2025
-"# ASP-Part2" 
